@@ -50,6 +50,38 @@ pub struct SkillRegistry {
 /// defensively but with a bound to avoid walking arbitrarily deep trees.
 const PLUGIN_SCAN_MAX_DEPTH: usize = 5;
 
+/// One Claude Code plugin install as recorded in `installed_plugins.json`.
+///
+/// `project_path` is set for project-scoped ("local") installs, which belong
+/// to a single workspace and must not leak into unrelated sessions.
+#[derive(Debug, Clone)]
+struct PluginInstall {
+    path: PathBuf,
+    project_path: Option<PathBuf>,
+}
+
+impl PluginInstall {
+    /// Whether this install participates in a load pass for `working_dir`.
+    ///
+    /// The global pass (`None`) takes only unscoped installs; a workspace pass
+    /// takes only installs owned by that workspace (or a parent of it).
+    fn applies_to(&self, working_dir: Option<&Path>) -> bool {
+        match (&self.project_path, working_dir) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(_), None) => false,
+            (Some(project), Some(dir)) => Self::within(dir, project),
+        }
+    }
+
+    /// True if `dir` is `project` or nested inside it, comparing canonical
+    /// paths when available so symlinked workspaces still match.
+    fn within(dir: &Path, project: &Path) -> bool {
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        canon(dir).starts_with(canon(project))
+    }
+}
+
 impl SkillRegistry {
     /// Process-wide shared mutable registry used by both `skill_manage` and
     /// direct slash invocation paths. Keeping a single registry prevents slash
@@ -246,7 +278,7 @@ impl SkillRegistry {
         // Load skills provided by Claude Code plugins/marketplace installs
         // first, so explicit jcode/agents skills with the same name win below.
         if let Some(plugins_root) = Self::claude_plugins_root() {
-            registry.load_plugin_skills_from_root(&plugins_root);
+            registry.load_plugin_skills_from_root(&plugins_root, None);
         }
 
         // Load from ~/.jcode/skills/ (jcode's own global skills)
@@ -276,6 +308,12 @@ impl SkillRegistry {
     /// process cwd (single-process CLI mode).
     pub fn load_project_overlay(working_dir: Option<&Path>) -> Result<Self> {
         let mut overlay = Self::default();
+        // Project-scoped ("local") Claude Code plugin installs belong to one
+        // workspace, so they load as part of that workspace's overlay rather
+        // than globally.
+        if let Some(plugins_root) = Self::claude_plugins_root() {
+            overlay.load_plugin_skills_from_root(&plugins_root, working_dir);
+        }
         overlay.load_project_local_dirs(working_dir)?;
         Ok(overlay)
     }
@@ -301,7 +339,7 @@ impl SkillRegistry {
     /// resolved against an optional active session working directory.
     pub fn load_for_working_dir(working_dir: Option<&Path>) -> Result<Self> {
         let mut registry = Self::load_global()?;
-        registry.load_project_local_dirs(working_dir)?;
+        registry.merge_overlay(Self::load_project_overlay(working_dir)?);
         Ok(registry)
     }
 
@@ -342,9 +380,17 @@ impl SkillRegistry {
     /// Load skills provided by Claude Code plugins under `plugins_root`.
     /// Returns the number of skills loaded. Errors are skipped so a broken
     /// plugin never prevents jcode's own skills from loading.
-    fn load_plugin_skills_from_root(&mut self, plugins_root: &Path) -> usize {
+    ///
+    /// `working_dir` selects which install scopes apply: `None` loads only
+    /// globally scoped installs, while `Some(dir)` loads only project-scoped
+    /// installs owned by that workspace.
+    fn load_plugin_skills_from_root(
+        &mut self,
+        plugins_root: &Path,
+        working_dir: Option<&Path>,
+    ) -> usize {
         let mut count = 0;
-        for dir in Self::plugin_skill_dirs_under(plugins_root) {
+        for dir in Self::plugin_skill_dirs_under(plugins_root, working_dir) {
             count += self.load_from_dir_count(&dir).unwrap_or(0);
         }
         count
@@ -362,22 +408,32 @@ impl SkillRegistry {
     ///
     /// `marketplaces/` is intentionally not scanned: it mirrors the full
     /// marketplace catalog, including plugins the user never installed.
-    fn plugin_skill_dirs_under(plugins_root: &Path) -> Vec<PathBuf> {
+    fn plugin_skill_dirs_under(plugins_root: &Path, working_dir: Option<&Path>) -> Vec<PathBuf> {
         if !plugins_root.is_dir() {
             return Vec::new();
         }
 
-        let mut roots: Vec<PathBuf> =
-            Self::installed_plugin_paths(&plugins_root.join("installed_plugins.json"));
-        if roots.is_empty() {
-            let cache = plugins_root.join("cache");
-            if cache.is_dir() {
-                roots.push(cache);
+        let installs = Self::installed_plugin_paths(&plugins_root.join("installed_plugins.json"));
+        let manifest_present = !installs.is_empty();
+        let mut roots: Vec<PathBuf> = installs
+            .into_iter()
+            .filter(|install| install.applies_to(working_dir))
+            .map(|install| install.path)
+            .collect();
+
+        // Unscoped legacy layouts only participate in the global pass; a
+        // project overlay must not re-load every cached plugin.
+        if working_dir.is_none() {
+            if !manifest_present {
+                let cache = plugins_root.join("cache");
+                if cache.is_dir() {
+                    roots.push(cache);
+                }
             }
-        }
-        let repos = plugins_root.join("repos");
-        if repos.is_dir() {
-            roots.push(repos);
+            let repos = plugins_root.join("repos");
+            if repos.is_dir() {
+                roots.push(repos);
+            }
         }
 
         let mut dirs = std::collections::BTreeSet::new();
@@ -387,10 +443,10 @@ impl SkillRegistry {
         dirs.into_iter().collect()
     }
 
-    /// Parse install paths from a Claude Code `installed_plugins.json`
+    /// Parse install entries from a Claude Code `installed_plugins.json`
     /// manifest. Tolerates both a list of installs per plugin (version 2) and
     /// a single install object, and skips paths that no longer exist.
-    fn installed_plugin_paths(manifest: &Path) -> Vec<PathBuf> {
+    fn installed_plugin_paths(manifest: &Path) -> Vec<PluginInstall> {
         let Ok(raw) = std::fs::read_to_string(manifest) else {
             return Vec::new();
         };
@@ -411,7 +467,16 @@ impl SkillRegistry {
                 if let Some(path) = install.get("installPath").and_then(|p| p.as_str()) {
                     let path = PathBuf::from(path);
                     if path.is_dir() {
-                        paths.push(path);
+                        // A "user"-scoped install is global even if it also
+                        // records the project it was installed from.
+                        let user_scoped =
+                            install.get("scope").and_then(|s| s.as_str()) == Some("user");
+                        let project_path = install
+                            .get("projectPath")
+                            .and_then(|p| p.as_str())
+                            .filter(|_| !user_scoped)
+                            .map(PathBuf::from);
+                        paths.push(PluginInstall { path, project_path });
                     }
                 }
             }
@@ -614,7 +679,7 @@ impl SkillRegistry {
         // Load skills provided by Claude Code plugins/marketplace installs
         // first, so explicit jcode/agents skills with the same name win below.
         if let Some(plugins_root) = Self::claude_plugins_root() {
-            count += self.load_plugin_skills_from_root(&plugins_root);
+            count += self.load_plugin_skills_from_root(&plugins_root, None);
         }
 
         // Load from ~/.jcode/skills/ (jcode's own global skills)
@@ -1411,7 +1476,7 @@ mod tests {
         write_installed_plugins_manifest(plugins_root, &[&install]);
 
         let mut registry = SkillRegistry::default();
-        let count = registry.load_plugin_skills_from_root(plugins_root);
+        let count = registry.load_plugin_skills_from_root(plugins_root, None);
 
         assert_eq!(count, 2);
         assert!(registry.contains("ai-gateway"));
@@ -1427,7 +1492,7 @@ mod tests {
         write_plugin_skill(&install, "cache-skill");
 
         let mut registry = SkillRegistry::default();
-        let count = registry.load_plugin_skills_from_root(plugins_root);
+        let count = registry.load_plugin_skills_from_root(plugins_root, None);
 
         assert_eq!(count, 1);
         assert!(registry.contains("cache-skill"));
@@ -1442,7 +1507,7 @@ mod tests {
         write_plugin_skill(&repo, "repo-skill");
 
         let mut registry = SkillRegistry::default();
-        let count = registry.load_plugin_skills_from_root(plugins_root);
+        let count = registry.load_plugin_skills_from_root(plugins_root, None);
 
         assert_eq!(count, 1);
         assert!(registry.contains("repo-skill"));
@@ -1470,7 +1535,7 @@ mod tests {
         );
 
         let mut registry = SkillRegistry::default();
-        registry.load_plugin_skills_from_root(plugins_root);
+        registry.load_plugin_skills_from_root(plugins_root, None);
 
         assert!(registry.contains("installed-skill"));
         assert!(
@@ -1493,7 +1558,7 @@ mod tests {
         write_plugin_skill(&too_deep, "too-deep-skill");
 
         let mut registry = SkillRegistry::default();
-        let count = registry.load_plugin_skills_from_root(plugins_root);
+        let count = registry.load_plugin_skills_from_root(plugins_root, None);
 
         assert_eq!(count, 0);
         assert!(!registry.contains("too-deep-skill"));
@@ -1513,7 +1578,7 @@ mod tests {
         // Mirror load ordering: plugins first, then explicit skill dirs, so
         // the later (explicit) insert wins in the registry map.
         let mut registry = SkillRegistry::default();
-        registry.load_plugin_skills_from_root(&plugins_root);
+        registry.load_plugin_skills_from_root(&plugins_root, None);
         registry
             .load_from_dir(&temp.path().join(".jcode/skills"))
             .expect("load explicit skills");
@@ -1529,6 +1594,99 @@ mod tests {
     fn plugin_skill_dirs_empty_for_missing_root() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing = temp.path().join("does-not-exist");
-        assert!(SkillRegistry::plugin_skill_dirs_under(&missing).is_empty());
+        assert!(SkillRegistry::plugin_skill_dirs_under(&missing, None).is_empty());
+    }
+
+    /// Project-scoped ("local") plugin installs must not leak into unrelated
+    /// sessions: they load only for the workspace that installed them.
+    #[test]
+    fn project_scoped_plugin_skills_load_only_in_their_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugins_root = temp.path().join("plugins");
+        let project = temp.path().join("my-project");
+        let other = temp.path().join("other-project");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&other).expect("create other project");
+
+        let user_install = plugins_root.join("cache/mkt/global-plugin/1.0.0");
+        write_plugin_skill(&user_install, "global-plugin-skill");
+        let local_install = plugins_root.join("cache/mkt/local-plugin/1.0.0");
+        write_plugin_skill(&local_install, "local-plugin-skill");
+
+        std::fs::write(
+            plugins_root.join("installed_plugins.json"),
+            serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "global-plugin@mkt": [{
+                        "scope": "user",
+                        "installPath": user_install,
+                        "version": "1.0.0",
+                    }],
+                    "local-plugin@mkt": [{
+                        "scope": "local",
+                        "projectPath": project,
+                        "installPath": local_install,
+                        "version": "1.0.0",
+                    }],
+                },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        // Global pass: only the user-scoped install.
+        let mut global = SkillRegistry::default();
+        global.load_plugin_skills_from_root(&plugins_root, None);
+        assert!(global.contains("global-plugin-skill"));
+        assert!(
+            !global.contains("local-plugin-skill"),
+            "project-scoped plugin skills must not load globally"
+        );
+
+        // Owning workspace (and nested dirs within it) sees the local install.
+        let nested = project.join("crates/inner");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        for dir in [project.as_path(), nested.as_path()] {
+            let mut scoped = SkillRegistry::default();
+            scoped.load_plugin_skills_from_root(&plugins_root, Some(dir));
+            assert!(
+                scoped.contains("local-plugin-skill"),
+                "local plugin skill must load under {}",
+                dir.display()
+            );
+            assert!(
+                !scoped.contains("global-plugin-skill"),
+                "global installs load in the global pass, not per workspace"
+            );
+        }
+
+        // An unrelated workspace sees neither.
+        let mut unrelated = SkillRegistry::default();
+        unrelated.load_plugin_skills_from_root(&plugins_root, Some(&other));
+        assert!(!unrelated.contains("local-plugin-skill"));
+        assert!(!unrelated.contains("global-plugin-skill"));
+    }
+
+    /// Legacy unscoped layouts (`repos/`, bare `cache/` without a manifest)
+    /// belong to the global pass only, so overlays stay cheap and isolated.
+    #[test]
+    fn project_overlay_pass_ignores_unscoped_legacy_layouts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugins_root = temp.path().join("plugins");
+        write_plugin_skill(&plugins_root.join("repos/owner/repo-plugin"), "repo-skill");
+        write_plugin_skill(&plugins_root.join("cache/mkt/cached/1.0.0"), "cache-skill");
+
+        let mut overlay = SkillRegistry::default();
+        overlay.load_plugin_skills_from_root(&plugins_root, Some(temp.path()));
+        assert!(
+            !overlay.contains("repo-skill") && !overlay.contains("cache-skill"),
+            "overlay pass must skip unscoped legacy layouts"
+        );
+
+        let mut global = SkillRegistry::default();
+        global.load_plugin_skills_from_root(&plugins_root, None);
+        assert!(global.contains("repo-skill"));
+        assert!(global.contains("cache-skill"));
     }
 }
